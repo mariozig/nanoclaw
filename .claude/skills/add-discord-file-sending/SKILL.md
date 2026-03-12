@@ -11,9 +11,15 @@ Adds `sendFile` implementation to the Discord channel so the agent can send file
 
 Add the `sendFile` method to the `DiscordChannel` class in `src/channels/discord.ts`.
 
-### Step 1: Add `fs` import
+### Step 1: Add imports
 
-Add `import fs from 'fs';` at the top of `src/channels/discord.ts` (if not already imported).
+Add `import fs from 'fs';` at the top of `src/channels/discord.ts` (if not already imported). Also add `GuildPremiumTier` to the discord.js import:
+
+```typescript
+import { GuildPremiumTier } from 'discord.js';
+```
+
+(Add it alongside the existing `TextChannel` import.)
 
 ### Step 2: Add `sendFile` method
 
@@ -36,19 +42,22 @@ async sendFile(jid: string, text: string, filePaths: string[]): Promise<void> {
     }
 
     const textChannel = channel as TextChannel;
-    const MAX_FILE_SIZE = 25 * 1024 * 1024; // 25MB Discord limit
     const MAX_FILES_PER_MESSAGE = 10;
 
-    // Filter to valid, existing files under size limit
+    // Server boost tier → file upload limit in MB.
+    // Source: https://support.discord.com/hc/en-us/articles/360028038352-Server-Boosting-FAQ
+    const TIER_UPLOAD_LIMITS: Record<number, number> = {
+      [GuildPremiumTier.None]: 25,
+      [GuildPremiumTier.Tier1]: 25,
+      [GuildPremiumTier.Tier2]: 50,
+      [GuildPremiumTier.Tier3]: 100,
+    };
+
+    // Filter to existing files only (skip missing, log warning)
     const validFiles: string[] = [];
     for (const filePath of filePaths) {
       if (!fs.existsSync(filePath)) {
         logger.warn({ filePath }, 'Discord sendFile: file not found, skipping');
-        continue;
-      }
-      const stat = fs.statSync(filePath);
-      if (stat.size > MAX_FILE_SIZE) {
-        logger.warn({ filePath, size: stat.size }, 'Discord sendFile: file exceeds 25MB limit, skipping');
         continue;
       }
       validFiles.push(filePath);
@@ -67,10 +76,39 @@ async sendFile(jid: string, text: string, filePaths: string[]): Promise<void> {
       const batch = validFiles.slice(i, i + MAX_FILES_PER_MESSAGE);
       const isFirstBatch = i === 0;
 
-      await textChannel.send({
-        content: isFirstBatch && text ? text : undefined,
-        files: batch,
-      });
+      try {
+        await textChannel.send({
+          content: isFirstBatch && text ? text : undefined,
+          files: batch,
+        });
+      } catch (err: any) {
+        // Handle Discord file-too-large errors (40005 = RequestEntityTooLarge, 50045 = FileUploadedExceedsMaximumSize)
+        if (err?.code === 40005 || err?.code === 50045) {
+          const fileInfo = batch.map((f) => {
+            const name = f.split('/').pop();
+            try {
+              const sizeMB = (fs.statSync(f).size / (1024 * 1024)).toFixed(1);
+              return `${name} (${sizeMB}MB)`;
+            } catch {
+              return name;
+            }
+          }).join(', ');
+          let errorMsg: string;
+
+          if ('guild' in textChannel && textChannel.guild) {
+            const tier = textChannel.guild.premiumTier;
+            const limitMB = TIER_UPLOAD_LIMITS[tier] ?? 25;
+            errorMsg = `File ${fileInfo} exceeds this server's ${limitMB}MB upload limit.`;
+          } else {
+            errorMsg = `File ${fileInfo} is too large to upload to Discord.`;
+          }
+
+          logger.warn({ jid, batch, code: err.code }, errorMsg);
+          await this.sendMessage(jid, errorMsg);
+          continue; // Continue with remaining batches
+        }
+        throw err; // Re-throw unexpected errors
+      }
     }
 
     logger.info({ jid, fileCount: validFiles.length }, 'Discord file message sent');
@@ -161,6 +199,106 @@ describe('sendFile', () => {
     // Don't connect
     await channel.sendFile('dc:1234567890123456', 'text', ['/some/file.png']);
     // No error
+  });
+
+  it('sends error message when file exceeds server upload limit', async () => {
+    const opts = createTestOpts();
+    const channel = new DiscordChannel('test-token', opts);
+    await channel.connect();
+
+    const discordError = new Error('Request entity too large');
+    Object.assign(discordError, { code: 40005 });
+
+    const mockChannel = {
+      send: vi.fn().mockRejectedValue(discordError),
+      sendTyping: vi.fn(),
+      guild: { premiumTier: 0 }, // No boost = 25MB limit
+    };
+    currentClient().channels.fetch.mockResolvedValue(mockChannel);
+
+    const tmpFile = path.join(os.tmpdir(), `test-large-${Date.now()}.bin`);
+    fs.writeFileSync(tmpFile, 'x');
+
+    try {
+      await channel.sendFile('dc:1234567890123456', 'Here is a big file', [tmpFile]);
+
+      // Should have sent an error message to the user via sendMessage
+      const sendCalls = mockChannel.send.mock.calls;
+      // Second call is from sendMessage fallback with the error text
+      const errorCall = sendCalls.find(
+        (call: any[]) => typeof call[0] === 'string' && call[0].includes('25MB upload limit')
+      );
+      expect(errorCall).toBeDefined();
+    } finally {
+      fs.unlinkSync(tmpFile);
+    }
+  });
+
+  it('sends error message with boosted server limit for code 50045', async () => {
+    const opts = createTestOpts();
+    const channel = new DiscordChannel('test-token', opts);
+    await channel.connect();
+
+    const discordError = new Error('File uploaded exceeds maximum size');
+    Object.assign(discordError, { code: 50045 });
+
+    const mockChannel = {
+      send: vi.fn()
+        .mockRejectedValueOnce(discordError)  // First call (file upload) fails
+        .mockResolvedValue(undefined),          // Subsequent calls (error message) succeed
+      sendTyping: vi.fn(),
+      guild: { premiumTier: 2 }, // Tier 2 = 50MB limit
+    };
+    currentClient().channels.fetch.mockResolvedValue(mockChannel);
+
+    const tmpFile = path.join(os.tmpdir(), `test-large-${Date.now()}.bin`);
+    fs.writeFileSync(tmpFile, 'x');
+
+    try {
+      await channel.sendFile('dc:1234567890123456', '', [tmpFile]);
+
+      // The error message should reference the 50MB limit
+      const sendCalls = mockChannel.send.mock.calls;
+      const errorCall = sendCalls.find(
+        (call: any[]) => typeof call[0] === 'string' && call[0].includes('50MB upload limit')
+      );
+      expect(errorCall).toBeDefined();
+    } finally {
+      fs.unlinkSync(tmpFile);
+    }
+  });
+
+  it('sends generic error when guild info is unavailable', async () => {
+    const opts = createTestOpts();
+    const channel = new DiscordChannel('test-token', opts);
+    await channel.connect();
+
+    const discordError = new Error('Request entity too large');
+    Object.assign(discordError, { code: 40005 });
+
+    const mockChannel = {
+      send: vi.fn()
+        .mockRejectedValueOnce(discordError)
+        .mockResolvedValue(undefined),
+      sendTyping: vi.fn(),
+      // No guild property (e.g. DM channel)
+    };
+    currentClient().channels.fetch.mockResolvedValue(mockChannel);
+
+    const tmpFile = path.join(os.tmpdir(), `test-large-${Date.now()}.bin`);
+    fs.writeFileSync(tmpFile, 'x');
+
+    try {
+      await channel.sendFile('dc:1234567890123456', '', [tmpFile]);
+
+      const sendCalls = mockChannel.send.mock.calls;
+      const errorCall = sendCalls.find(
+        (call: any[]) => typeof call[0] === 'string' && call[0].includes('too large to upload to Discord')
+      );
+      expect(errorCall).toBeDefined();
+    } finally {
+      fs.unlinkSync(tmpFile);
+    }
   });
 });
 ```
